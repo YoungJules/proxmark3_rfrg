@@ -8343,7 +8343,8 @@ static int CmdHF14AMfWipe(const char *Cmd) {
             break;
         }
         default: {
-            PrintAndLogEx(INFO, "wrong key file size.  got %zu", keyslen);
+            PrintAndLogEx(INFO, "wrong key file size.  got %zu, expecting one of %zu, %zu, %zu, or %zu", keyslen, MIFARE_MINI_MAX_KEY_SIZE, MIFARE_1K_EV1_MAX_KEY_SIZE,
+                MIFARE_1K_MAX_KEY_SIZE, MIFARE_4K_MAX_KEY_SIZE);
             goto out;
         }
     }
