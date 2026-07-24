@@ -30,6 +30,11 @@
 #include "util_posix.h" // msleep
 
 static int CmdHelp(const char *Cmd);
+static int decode_and_print_memory(uint16_t card_size, const uint8_t *input_buffer);
+
+static uint16_t legic_resp_len16(const PacketResponseNG *resp) {
+    return (uint16_t)(resp->data.asBytes[0] | ((uint16_t)resp->data.asBytes[1] << 8));
+}
 
 #define LEGIC_PRIME_MIM22   22
 #define LEGIC_PRIME_MIM256  256
@@ -61,6 +66,399 @@ static bool legic_xor(uint8_t *data, uint16_t cardsize) {
 static void legic_xor_with_crc(uint8_t *data, uint16_t cardsize, uint8_t crc) {
     for (uint16_t i = 22; i < cardsize; i++) {
         data[i] ^= crc;
+    }
+}
+
+static const char *legic_compare_region(size_t offset) {
+    if (offset < 4) {
+        return "UID";
+    }
+
+    if (offset == 4) {
+        return "MCC";
+    }
+
+    if (offset < 7) {
+        return "DCF";
+    }
+
+    if (offset < 22) {
+        return "HDR";
+    }
+
+    return "DATA";
+}
+
+static bool legic_compare_is_segmented(const uint8_t *data, size_t len) {
+    return (len > 8 && data[7] == 0x9F && data[8] == 0xFF);
+}
+
+static void legic_compare_region_detailed(const uint8_t *data, size_t len, size_t offset, char *label, size_t label_len) {
+    if (label == NULL || label_len == 0) {
+        return;
+    }
+
+    if (offset < 4) {
+        snprintf(label, label_len, "UID");
+        return;
+    }
+
+    if (offset == 4) {
+        snprintf(label, label_len, "MCC");
+        return;
+    }
+
+    if (offset < 7) {
+        snprintf(label, label_len, "DCF");
+        return;
+    }
+
+    if (!legic_compare_is_segmented(data, len)) {
+        snprintf(label, label_len, (offset < 22) ? "HDR" : "DATA");
+        return;
+    }
+
+    if (offset < 22) {
+        snprintf(label, label_len, "HDR");
+        return;
+    }
+
+    size_t i = 22;
+    for (size_t segnum = 1; segnum < 128; segnum++) {
+        if ((i + 5) > len) {
+            break;
+        }
+
+        uint16_t seg_len = (((uint16_t)data[i + 1] & 0x0F) << 8) | data[i];
+        if (seg_len < 5 || i + seg_len > len) {
+            break;
+        }
+
+        size_t seg_end = i + seg_len;
+        size_t payload_start = i + 5;
+        uint16_t wrp = data[i + 2] ^ data[4];
+        uint16_t wrc = (data[i + 3] ^ data[4]) & 0x70;
+        wrc >>= 4;
+
+        char seg_label[8];
+        snprintf(seg_label, sizeof(seg_label), "SEG%02zu", segnum);
+
+        if (offset >= i && offset < i + 5) {
+            snprintf(label, label_len, "%s:HDR", seg_label);
+            return;
+        }
+
+        if (offset >= payload_start && offset < payload_start + wrc) {
+            snprintf(label, label_len, "%s:WRC", seg_label);
+            return;
+        }
+
+        if (offset >= payload_start + wrc && offset < payload_start + wrp) {
+            snprintf(label, label_len, "%s:WRP", seg_label);
+            return;
+        }
+
+        if (offset >= payload_start + wrp && offset < seg_end) {
+            snprintf(label, label_len, "%s:PAY", seg_label);
+            return;
+        }
+
+        if (data[i + 1] & 0x80) {
+            break;
+        }
+
+        i = seg_end;
+    }
+
+    snprintf(label, label_len, "UNUSED");
+}
+
+typedef enum {
+    LEGIC_BUCKET_NOISE = 0,
+    LEGIC_BUCKET_CRITICAL = 1,
+    LEGIC_BUCKET_IDENTITY = 2,
+} legic_compare_bucket_t;
+
+static const char *legic_compare_bucket_name(legic_compare_bucket_t bucket) {
+    switch (bucket) {
+        case LEGIC_BUCKET_IDENTITY:
+            return "IDENTITY";
+        case LEGIC_BUCKET_CRITICAL:
+            return "CRITICAL";
+        case LEGIC_BUCKET_NOISE:
+        default:
+            return "NOISE";
+    }
+}
+
+static legic_compare_bucket_t legic_compare_bucket_from_region(const char *region) {
+    if (region == NULL) {
+        return LEGIC_BUCKET_NOISE;
+    }
+
+    if (strcmp(region, "UID") == 0 || strcmp(region, "MCC") == 0 || strcmp(region, "DCF") == 0) {
+        return LEGIC_BUCKET_IDENTITY;
+    }
+
+    if (strstr(region, ":HDR") != NULL || strstr(region, ":WRC") != NULL || strstr(region, ":WRP") != NULL || strstr(region, ":PAY") != NULL || strcmp(region, "HDR") == 0) {
+        return LEGIC_BUCKET_CRITICAL;
+    }
+
+    return LEGIC_BUCKET_NOISE;
+}
+
+static void legic_compare_format_hex(const uint8_t *data, size_t len, size_t start, size_t count, char *out, size_t out_len) {
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    size_t pos = 0;
+    for (size_t i = 0; i < count && (start + i) < len; i++) {
+        int written = snprintf(out + pos, out_len - pos, "%02X%s", data[start + i], (i + 1 < count && (start + i + 1) < len) ? " " : "");
+        if (written < 0 || (size_t)written >= (out_len - pos)) {
+            break;
+        }
+        pos += (size_t)written;
+    }
+}
+
+static int legic_load_dump_file(const char *filename, uint8_t **dump, size_t *bytes_read) {
+    int res = pm3_load_dump(filename, (void **)dump, bytes_read, LEGIC_PRIME_MIM1024);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    if (!(*bytes_read == LEGIC_PRIME_MIM22 || *bytes_read == LEGIC_PRIME_MIM256 || *bytes_read == LEGIC_PRIME_MIM1024)) {
+        PrintAndLogEx(FAILED, "Bytebuffer is not any known legic card size! (MIM22, MIM256, MIM1024)");
+        free(*dump);
+        *dump = NULL;
+        *bytes_read = 0;
+        return PM3_EFAILED;
+    }
+
+    return PM3_SUCCESS;
+}
+
+static int legic_load_live_badge(uint8_t **dump, size_t *bytes_read) {
+    legic_card_select_t card;
+    if (legic_get_type(&card) != PM3_SUCCESS) {
+        PrintAndLogEx(WARNING, "Failed to identify tagtype");
+        return PM3_ESOFT;
+    }
+
+    legic_print_type(card.cardsize, 0);
+
+    legic_packet_t *payload = calloc(1, sizeof(legic_packet_t));
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
+    payload->offset = 0;
+    payload->iv = 0x55;
+    payload->len = card.cardsize;
+
+    PacketResponseNG resp;
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_LEGIC_READER, (uint8_t *)payload, sizeof(legic_packet_t));
+    free(payload);
+
+    uint8_t timeout = 0;
+    while (WaitForResponseTimeout(CMD_HF_LEGIC_READER, &resp, 2000) == false) {
+        ++timeout;
+        PrintAndLogEx(NORMAL, "." NOLF);
+        if (timeout > 10) {
+            PrintAndLogEx(WARNING, "\ncommand execution time out");
+            return PM3_ETIMEOUT;
+        }
+    }
+    PrintAndLogEx(NORMAL, "");
+
+    if (resp.status != PM3_SUCCESS) {
+        PrintAndLogEx(WARNING, "Failed dumping tag data");
+        return PM3_ERFTRANS;
+    }
+
+    *bytes_read = legic_resp_len16(&resp);
+    *dump = calloc(*bytes_read, sizeof(uint8_t));
+    if (*dump == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
+    if (*bytes_read != card.cardsize) {
+        PrintAndLogEx(WARNING, "Fail, only managed to read 0x%02X bytes of 0x%02X", (unsigned int)*bytes_read, card.cardsize);
+    }
+
+    if (GetFromDevice(BIG_BUF_EML, *dump, *bytes_read, 0, NULL, 0, NULL, 2500, false) == false) {
+        PrintAndLogEx(WARNING, "Fail, transfer from device time-out");
+        free(*dump);
+        *dump = NULL;
+        *bytes_read = 0;
+        return PM3_ETIMEOUT;
+    }
+
+    return PM3_SUCCESS;
+}
+
+static int legic_compare_dumps(const uint8_t *a, const uint8_t *b, size_t len, bool verbose, bool detailed_regions) {
+    size_t diffs = 0;
+    size_t bucket_identity = 0;
+    size_t bucket_critical = 0;
+    size_t bucket_noise = 0;
+
+    PrintAndLogEx(INFO, "--- " _CYAN_("Compare") " --------------------------------------------");
+    PrintAndLogEx(INFO, "offset  region (A)     bucket     span  bytes");
+    PrintAndLogEx(INFO, "       region (B)     bucket           bytes");
+    PrintAndLogEx(INFO, "--------------------------------------------------------------");
+
+    for (size_t i = 0; i < len;) {
+        if (a[i] == b[i]) {
+            ++i;
+            continue;
+        }
+
+        size_t start = i;
+        while (i < len && a[i] != b[i]) {
+            ++i;
+        }
+
+        size_t run_len = i - start;
+        diffs += run_len;
+
+        for (size_t chunk = 0; chunk < run_len; chunk += 16) {
+            size_t n = MIN((size_t)16, run_len - chunk);
+            char region_a[24] = {0};
+            char region_b[24] = {0};
+            char bytes_a[64] = {0};
+            char bytes_b[64] = {0};
+
+            if (detailed_regions) {
+                legic_compare_region_detailed(a, len, start + chunk, region_a, sizeof(region_a));
+                legic_compare_region_detailed(b, len, start + chunk, region_b, sizeof(region_b));
+            } else {
+                snprintf(region_a, sizeof(region_a), "%s", legic_compare_region(start + chunk));
+                snprintf(region_b, sizeof(region_b), "%s", legic_compare_region(start + chunk));
+            }
+
+            legic_compare_bucket_t bucket_a = legic_compare_bucket_from_region(region_a);
+            legic_compare_bucket_t bucket_b = legic_compare_bucket_from_region(region_b);
+            legic_compare_bucket_t bucket = bucket_a;
+            if (bucket_b > bucket) {
+                bucket = bucket_b;
+            }
+
+            switch (bucket) {
+                case LEGIC_BUCKET_IDENTITY:
+                    bucket_identity += n;
+                    break;
+                case LEGIC_BUCKET_CRITICAL:
+                    bucket_critical += n;
+                    break;
+                case LEGIC_BUCKET_NOISE:
+                    bucket_noise += n;
+                    break;
+                default:
+                    break;
+            }
+
+            legic_compare_format_hex(a, len, start + chunk, n, bytes_a, sizeof(bytes_a));
+            legic_compare_format_hex(b, len, start + chunk, n, bytes_b, sizeof(bytes_b));
+
+            PrintAndLogEx(SUCCESS, "%5zu  %-12s (A) [%-9s] %4zu  %s", start + chunk, region_a, legic_compare_bucket_name(bucket), n, bytes_a);
+            PrintAndLogEx(SUCCESS, "       %-12s (B) [%-9s] %4s  %s", region_b, legic_compare_bucket_name(bucket), "", bytes_b);
+        }
+    }
+
+    PrintAndLogEx(INFO, "--------------------------------------------------------------");
+    if (diffs == 0) {
+        PrintAndLogEx(SUCCESS, "No byte differences found.");
+    } else {
+        PrintAndLogEx(INFO, "Total differing bytes: %zu", diffs);
+        PrintAndLogEx(INFO, "Buckets: IDENTITY=%zu CRITICAL=%zu NOISE=%zu", bucket_identity, bucket_critical, bucket_noise);
+    }
+
+    if (verbose) {
+        PrintAndLogEx(NORMAL, "");
+        PrintAndLogEx(INFO, _YELLOW_("Badge A decoded view (raw dump bytes)"));
+        PrintAndLogEx(NORMAL, "");
+        decode_and_print_memory((uint16_t)len, a);
+
+        PrintAndLogEx(NORMAL, "");
+        PrintAndLogEx(INFO, _YELLOW_("Badge B decoded view (raw dump bytes)"));
+        PrintAndLogEx(NORMAL, "");
+        decode_and_print_memory((uint16_t)len, b);
+    }
+
+    return PM3_SUCCESS;
+}
+
+static void legic_compare_print_segment_headers(const uint8_t *a, const uint8_t *b, size_t len) {
+    if (len < 22) {
+        return;
+    }
+
+    bool a_segmented = (len > 8 && a[7] == 0x9F && a[8] == 0xFF);
+    bool b_segmented = (len > 8 && b[7] == 0x9F && b[8] == 0xFF);
+    if (!a_segmented && !b_segmented) {
+        PrintAndLogEx(INFO, "No segmented header found in either dump.");
+        return;
+    }
+
+    PrintAndLogEx(INFO, "--- " _CYAN_("Segment/Header") " ------------------------------------");
+    PrintAndLogEx(INFO, "seg   field        A       B");
+    PrintAndLogEx(INFO, "--------------------------------");
+
+    size_t i = 22;
+    for (size_t segnum = 1; segnum < 128; segnum++) {
+        if ((i + 5) > len) {
+            break;
+        }
+
+        uint16_t len_a = (((uint16_t)a[i + 1] & 0x0F) << 8) | a[i];
+        uint16_t len_b = (((uint16_t)b[i + 1] & 0x0F) << 8) | b[i];
+        uint8_t flag_a = (a[i + 1] & 0xF0) >> 4;
+        uint8_t flag_b = (b[i + 1] & 0xF0) >> 4;
+        uint8_t wrp_a = a[i + 2];
+        uint8_t wrp_b = b[i + 2];
+        uint8_t wrc_a = (a[i + 3] & 0x70) >> 4;
+        uint8_t wrc_b = (b[i + 3] & 0x70) >> 4;
+        uint8_t rd_a = (a[i + 3] & 0x80) >> 7;
+        uint8_t rd_b = (b[i + 3] & 0x80) >> 7;
+        uint8_t crc_a = a[i + 4];
+        uint8_t crc_b = b[i + 4];
+
+        char seg_label[8];
+        snprintf(seg_label, sizeof(seg_label), "SEG%02zu", segnum);
+
+        if (len_a != len_b) {
+            PrintAndLogEx(SUCCESS, "%3s %-10s %5u   %5u", seg_label, "length", len_a, len_b);
+        }
+        if (flag_a != flag_b) {
+            PrintAndLogEx(SUCCESS, "%3s %-10s %5u   %5u", seg_label, "flags", flag_a, flag_b);
+        }
+        if (wrp_a != wrp_b) {
+            PrintAndLogEx(SUCCESS, "%3s %-10s %5u   %5u", seg_label, "wrp", wrp_a, wrp_b);
+        }
+        if (wrc_a != wrc_b) {
+            PrintAndLogEx(SUCCESS, "%3s %-10s %5u   %5u", seg_label, "wrc", wrc_a, wrc_b);
+        }
+        if (rd_a != rd_b) {
+            PrintAndLogEx(SUCCESS, "%3s %-10s %5u   %5u", seg_label, "rd", rd_a, rd_b);
+        }
+        if (crc_a != crc_b) {
+            PrintAndLogEx(SUCCESS, "%3s %-10s %5u   %5u", seg_label, "crc", crc_a, crc_b);
+        }
+
+        if (a[i + 1] & 0x80) {
+            break;
+        }
+
+        i += len_a;
+        if (i >= len) {
+            break;
+        }
     }
 }
 
@@ -885,7 +1283,7 @@ int legic_read_mem(uint32_t offset, uint32_t len, uint32_t iv, uint8_t *out, uin
     }
     PrintAndLogEx(NORMAL, "");
 
-    *outlen = resp.data.asDwords[0];
+    *outlen = legic_resp_len16(&resp);
     if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(WARNING, "Failed reading tag");
         return PM3_ESOFT;
@@ -1071,7 +1469,7 @@ static int CmdLegicDump(const char *Cmd) {
         return PM3_ERFTRANS;
     }
 
-    uint16_t readlen = resp.data.asDwords[0];
+    uint16_t readlen = legic_resp_len16(&resp);
     uint8_t *data = calloc(readlen, sizeof(uint8_t));
     if (data == NULL) {
         PrintAndLogEx(WARNING, "Failed to allocate memory");
@@ -1204,7 +1602,7 @@ static int CmdLegicClone(const char *Cmd) {
     int mcc_len = 0;
     uint8_t mcc_buf[1] = {0};
     bool has_mcc = false;
-    if (arg_get_str(ctx, 2) != NULL) {
+    if (arg_get_str(ctx, 2)->count > 0) {
         CLIParamStrToBuf(arg_get_str(ctx, 2), mcc_buf, sizeof(mcc_buf), &mcc_len);
         has_mcc = (mcc_len == 1);
         if (!has_mcc) {
@@ -1216,7 +1614,7 @@ static int CmdLegicClone(const char *Cmd) {
 
     int outlen = 0;
     char outfilename[FILE_PATH_SIZE] = {0};
-    if (arg_get_str(ctx, 3) != NULL) {
+    if (arg_get_str(ctx, 3)->count > 0) {
         CLIParamStrToBuf(arg_get_str(ctx, 3), (uint8_t *)outfilename, FILE_PATH_SIZE, &outlen);
         if (outlen < 1) {
             PrintAndLogEx(WARNING, "Output filename is invalid");
@@ -1321,6 +1719,188 @@ static int CmdLegicClone(const char *Cmd) {
     free(dump);
     PrintAndLogEx(SUCCESS, "Done!");
     return PM3_SUCCESS;
+}
+
+static int CmdLegicCompare(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf legic compare",
+                  "Compare two LEGIC Prime dump files, or compare a dump file against the currently attached badge. By default both inputs are deobfuscated before the compare so the output matches the decoded LEGIC view.",
+                  "hf legic compare -a badgeA.bin -b badgeB.bin\n"
+                  "hf legic compare -a badgeA.bin -b badgeB.bin --verbose\n"
+                  "hf legic compare -a badgeA.bin -b badgeB.bin --raw\n"
+                  "hf legic compare -a badge.bin --live\n"
+                  "hf legic compare -a badge.bin --live --verbose");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str1("a", NULL, "<fn>", "first input dump"),
+        arg_str0("b", NULL, "<fn>", "second input dump"),
+        arg_lit0(NULL, "raw", "compare raw dump bytes without deobfuscation"),
+        arg_lit0("v", "verbose", "print decoded views for both dumps"),
+        arg_lit0(NULL, "live", "compare against the currently attached badge"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    int fnlenA = 0;
+    char filenameA[FILE_PATH_SIZE] = {0};
+    CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)filenameA, FILE_PATH_SIZE, &fnlenA);
+
+    int fnlenB = 0;
+    char filenameB[FILE_PATH_SIZE] = {0};
+    if (arg_get_str(ctx, 2)->count > 0) {
+        CLIParamStrToBuf(arg_get_str(ctx, 2), (uint8_t *)filenameB, FILE_PATH_SIZE, &fnlenB);
+    }
+
+    bool raw_compare = arg_get_lit(ctx, 3);
+    bool verbose = arg_get_lit(ctx, 4);
+    bool compare_live = arg_get_lit(ctx, 5);
+    CLIParserFree(ctx);
+
+    if (fnlenA < 1) {
+        PrintAndLogEx(WARNING, "Input dump filename is required");
+        return PM3_EINVARG;
+    }
+
+    if (!compare_live && fnlenB < 1) {
+        PrintAndLogEx(WARNING, "Two dump filenames are required");
+        return PM3_EINVARG;
+    }
+
+    if (compare_live && fnlenB > 0) {
+        PrintAndLogEx(WARNING, "Use either --live or a second dump file, not both");
+        return PM3_EINVARG;
+    }
+
+    uint8_t *dumpA = NULL;
+    uint8_t *dumpB = NULL;
+    uint8_t *cmpA = NULL;
+    uint8_t *cmpB = NULL;
+    size_t lenA = 0;
+    size_t lenB = 0;
+
+    int res = legic_load_dump_file(filenameA, &dumpA, &lenA);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    if (compare_live) {
+        res = legic_load_live_badge(&dumpB, &lenB);
+    } else {
+        res = legic_load_dump_file(filenameB, &dumpB, &lenB);
+    }
+    if (res != PM3_SUCCESS) {
+        free(dumpA);
+        return res;
+    }
+
+    if (lenA != lenB) {
+        PrintAndLogEx(WARNING, "Dump sizes differ: %zu vs %zu", lenA, lenB);
+        free(dumpA);
+        free(dumpB);
+        return PM3_EFILE;
+    }
+
+    if (!raw_compare) {
+        cmpA = calloc(lenA, sizeof(uint8_t));
+        cmpB = calloc(lenB, sizeof(uint8_t));
+        if (cmpA == NULL || cmpB == NULL) {
+            free(dumpA);
+            free(dumpB);
+            free(cmpA);
+            free(cmpB);
+            return PM3_EMALLOC;
+        }
+
+        memcpy(cmpA, dumpA, lenA);
+        memcpy(cmpB, dumpB, lenB);
+
+        if (legic_xor(cmpA, (uint16_t)lenA) == false) {
+            PrintAndLogEx(FAILED, "Failed to deobfuscate %s", filenameA);
+            PrintAndLogEx(HINT, "Use --raw if the input files are already deobfuscated");
+            free(dumpA);
+            free(dumpB);
+            free(cmpA);
+            free(cmpB);
+            return PM3_EFAILED;
+        }
+
+        if (legic_xor(cmpB, (uint16_t)lenB) == false) {
+            PrintAndLogEx(FAILED, "Failed to deobfuscate %s", filenameB);
+            PrintAndLogEx(HINT, "Use --raw if the input files are already deobfuscated");
+            free(dumpA);
+            free(dumpB);
+            free(cmpA);
+            free(cmpB);
+            return PM3_EFAILED;
+        }
+    } else {
+        cmpA = dumpA;
+        cmpB = dumpB;
+    }
+
+    legic_print_type((uint32_t)lenA, 0);
+    if (compare_live) {
+        PrintAndLogEx(SUCCESS, "Comparing %s to current badge (%s)", filenameA, raw_compare ? "raw" : "deobfuscated");
+    } else {
+        PrintAndLogEx(SUCCESS, "Comparing %s to %s (%s)", filenameA, filenameB, raw_compare ? "raw" : "deobfuscated");
+    }
+
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(INFO, _CYAN_("Raw diff"));
+    res = legic_compare_dumps(dumpA, dumpB, lenA, false, false);
+    if (res != PM3_SUCCESS) {
+        free(dumpA);
+        free(dumpB);
+        if (cmpA != dumpA) {
+            free(cmpA);
+        }
+        if (cmpB != dumpB) {
+            free(cmpB);
+        }
+        return res;
+    }
+
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(INFO, _CYAN_("Decoded diff"));
+    res = legic_compare_dumps(cmpA, cmpB, lenA, false, true);
+    if (res != PM3_SUCCESS) {
+        free(dumpA);
+        free(dumpB);
+        if (cmpA != dumpA) {
+            free(cmpA);
+        }
+        if (cmpB != dumpB) {
+            free(cmpB);
+        }
+        return res;
+    }
+
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(INFO, _CYAN_("Segment/Header diff"));
+    legic_compare_print_segment_headers(cmpA, cmpB, lenA);
+
+    if (verbose) {
+        PrintAndLogEx(NORMAL, "");
+        PrintAndLogEx(INFO, _YELLOW_("Badge A decoded view (raw dump bytes)"));
+        PrintAndLogEx(NORMAL, "");
+        decode_and_print_memory((uint16_t)lenA, dumpA);
+
+        PrintAndLogEx(NORMAL, "");
+        PrintAndLogEx(INFO, _YELLOW_("Badge B decoded view (raw dump bytes)"));
+        PrintAndLogEx(NORMAL, "");
+        decode_and_print_memory((uint16_t)lenB, dumpB);
+    }
+
+    free(dumpA);
+    free(dumpB);
+    if (cmpA != dumpA) {
+        free(cmpA);
+    }
+    if (cmpB != dumpB) {
+        free(cmpB);
+    }
+    return res;
 }
 
 static int CmdLegicELoad(const char *Cmd) {
@@ -1713,6 +2293,7 @@ static command_t CommandTable[] =  {
     {"reader",  CmdLegicReader,   IfPm3Legicrf,    "LEGIC Prime Reader UID and tag info"},
     {"restore", CmdLegicRestore,  IfPm3Legicrf,    "Restore a dump file onto a LEGIC Prime tag"},
     {"clone",   CmdLegicClone,    IfPm3Legicrf,    "Clone a LEGIC Prime dump to a new MCC or tag"},
+    {"compare",  CmdLegicCompare,  AlwaysAvailable, "Compare two LEGIC Prime dump files"},
     {"wipe",    CmdLegicWipe,     IfPm3Legicrf,    "Wipe a LEGIC Prime tag"},
     {"wrbl",    CmdLegicWrbl,     IfPm3Legicrf,    "Write data to a LEGIC Prime tag"},
     {"-----------", CmdHelp,      AlwaysAvailable, "--------------------- " _CYAN_("simulation") " ---------------------"},
