@@ -544,6 +544,7 @@ Check column "offline" for their availability.
 |`hf legic reader        `|N       |`LEGIC Prime Reader UID and tag info`
 |`hf legic restore       `|N       |`Restore a dump file onto a LEGIC Prime tag`
 |`hf legic clone         `|N       |`Clone a LEGIC Prime dump to a new MCC or tag`
+|`hf legic compare       `|Y       |`Compare two LEGIC Prime dumps, or a dump against the current badge`
 |`hf legic wipe          `|N       |`Wipe a LEGIC Prime tag`
 |`hf legic wrbl          `|N       |`Write data to a LEGIC Prime tag`
 |`hf legic sim           `|N       |`Start tag simulator`
@@ -553,6 +554,18 @@ Check column "offline" for their availability.
 |`hf legic einfo         `|N       |`Display deobfuscated and decoded emulator memory`
 |`hf legic crc           `|Y       |`Calculate Legic CRC over given bytes`
 |`hf legic view          `|Y       |`Display deobfuscated and decoded content from tag dump file`
+
+Recommended migration check:
+
+`hf legic dump -f clone.bin`
+
+`hf legic info`
+
+`hf legic compare -a original.bin -b clone.bin --verbose`
+
+If you need to compare a clone directly against the attached badge, use `--live`:
+
+`hf legic compare -a original.bin --live --verbose`
 
 
 ### hf lto
