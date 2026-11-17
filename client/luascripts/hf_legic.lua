@@ -513,7 +513,7 @@ function bytesToTag(bytes, tag)
     tag.DCFh=padString(bytes[7]);
     tag.raw =padString(bytes[8]);
     tag.SSC =padString(bytes[9]);
-    tag.Type=getTokenType(tag.DCFl);
+    tag.Type=getTokenType(tag.DCFl, tag.DCFh);
     --tag.OLE=bbit("0x"..tag.DCFl,7,1)
     tag.OLE=(tonumber(tag.DCFl, 16) >> 7) & 0x01
             --tag.WRP=("%d"):format(bbit("0x"..bytes[8],0,4))
@@ -522,8 +522,8 @@ function bytesToTag(bytes, tag)
     tag.WRC = string.format("%02d", (tonumber(bytes[8], 16) >> 4) & 0x07)
     --tag.RD=("%d"):format(bbit("0x"..bytes[8],7,1))
     tag.RD=string.format("%02d", (tonumber(bytes[8],16) >> 7) & 0x01)
-    if (tag.Type=="SAM" and tag.raw=='9f') then
-        tag.Stamp_len=(0xfc - tonumber(tag.DCFh,16) & 0xFF)
+    if (tag.Type ~= "SAM" or tag.raw == '9f') then
+        tag.Stamp_len=getStampLength(tag.DCFl, tag.DCFh)
         --tag.Stamp_len=(0xfc-bbit("0x"..tag.DCFh,0,8))
     elseif (tag.Type=="SAM" and (tag.raw=='08' or tag.raw=='09')) then
       tag.Stamp_len = tonumber(tag.raw,10)
@@ -1647,12 +1647,12 @@ function print3rdPartyCash1(tag, x)
 -- make token
 function makeToken()
   local mt={
-    ['Type']    = {"SAM", "SAM63", "SAM64", "IAM", "GAM"},
-    ['DCF']     = {"60ea", "31fa", "30fa", "80fa", "f0fa"},
-    ['WRP']     = {"15", "2", "2", "2", "2"},
-    ['WRC']     = {"01", "02", "02", "00", "00"},
-    ['RD']      = {"01", "00", "00", "00", "00"},
-    ['Stamp']   = {"00", "00", "00", "00", "00"},
+    ['Type']    = {"SAM", "SAM63", "SAM64", "IAM", "GAM", "XAM"},
+    ['DCF']     = {"60ea", "31fa", "30fa", "20f8", "f0fa", "8fec"},
+    ['WRP']     = {"15", "2", "2", "2", "2", "4"},
+    ['WRC']     = {"01", "02", "02", "00", "00", "00"},
+    ['RD']      = {"01", "00", "00", "00", "00", "00"},
+    ['Stamp']   = {"00", "00", "00", "00", "00", "00"},
     ['Segment'] = {"0d", "c0", "04", "00", "be", "01", "02", "03", "04", "01", "02", "03", "04"}
   }
   ttype=""
@@ -1714,7 +1714,7 @@ function editTag(tag)
         -- on MT: SSC holds the Starting Stamp Character (Stamp0)
         tag.SSC=input(ttype.."0: ", tag.SSC)
         -- rest of stamp-bytes are in tag.data 0..n
-        for i=0, (tonumber(0xfc ,10)-("%d"):format('0x'..tag.DCFh))-2 do
+        for i=0, getStampLength(tag.DCFl, tag.DCFh) - 2 do
         tag.data[i] = input(ttype.. i+1 ..": ", tag.data[i])
         end
       else
@@ -1761,8 +1761,8 @@ function calcHeaderRaw(wrp, wrc, rd)
 end
 
 ---
--- determine TagType (bits 0..6 of DCFlow)
-function getTokenType(DCFl)
+-- determine TagType from the decremental field
+function getTokenType(DCFl, DCFh)
   --[[
     0x00–0x2f IAM
     0x30–0x6f SAM
@@ -1770,13 +1770,23 @@ function getTokenType(DCFl)
   ]]--
         --local tt = bbit("0x"..DCFl,0,7)
   local tt = tonumber(DCFl, 16) & 0x7F
-  if (tt >= 0 and tt <= 47) then tt = "IAM"
+  if (DCFh == "ec") then tt = "XAM"
+  elseif (tt >= 0 and tt <= 47) then tt = "IAM"
   elseif (tt == 49) then tt = "SAM63"
   elseif (tt == 48) then tt = "SAM64"
   elseif (tt >= 50 and tt <= 111) then tt = "SAM"
   elseif (tt >= 112 and tt <= 127) then tt = "GAM"
   else tt = "???" end
   return tt
+end
+
+---
+-- determine stamp length from the decremental field
+function getStampLength(DCFl, DCFh)
+  if (DCFh == "ec") then
+    return 0x0c - (tonumber(DCFl, 16) >> 4)
+  end
+  return 0xfc - tonumber(DCFh, 16)
 end
 
 ---
@@ -2359,7 +2369,7 @@ end
 function calcMtCrc(bytes)
   --print(#bytes)
   local cmd=bytes[1]..bytes[2]..bytes[3]..bytes[4]..bytes[7]..bytes[6]..bytes[8]
-  local len=(tonumber(0xfc ,10)-("%d"):format('0x'..bytes[7]))
+  local len = getStampLength(bytes[6], bytes[7])
   for i=1, len do
     cmd=cmd..bytes[8+i]
   end
